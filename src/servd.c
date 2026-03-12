@@ -67,13 +67,37 @@ struct nid_stats {
   char ns_nid[];
 };
 
-#define LXT_TYPE_MDS 0
+/* l_type values stored in struct lxt.l_type (1-bit field). */
+#define LXT_TYPE_OST 0
 #define LXT_TYPE_MDT 1
-#define LXT_TYPE_OST 2
-static const char *top_dir_path[] = {
-  [LXT_TYPE_MDS] = "/proc/fs/lustre/mds",
-  [LXT_TYPE_MDT] = "/proc/fs/lustre/mdt",
-  [LXT_TYPE_OST] = "/proc/fs/lustre/obdfilter",
+
+/* Candidate paths for MDT export stats, in descending priority order.
+ * The first accessible path wins; the rest are skipped to avoid
+ * double-counting when both /proc and debugfs entries exist (Lustre 2.10+).
+ */
+static const char * const mdt_paths[] = {
+  "/sys/kernel/debug/lustre/mdt",  /* Lustre 2.10+ (debugfs) */
+  "/proc/fs/lustre/mdt",           /* Lustre 2.x */
+  "/proc/fs/lustre/mds",           /* Lustre 1.x */
+  NULL,
+};
+
+/* Candidate paths for OST export stats, in descending priority order.
+ * ofd replaced obdfilter in Lustre 2.4.
+ */
+static const char * const ost_paths[] = {
+  "/sys/kernel/debug/lustre/ofd",  /* Lustre 2.10+ (debugfs) */
+  "/proc/fs/lustre/ofd",           /* Lustre 2.4+ */
+  "/proc/fs/lustre/obdfilter",     /* Lustre 1.x/2.x legacy */
+  NULL,
+};
+
+static const struct {
+  const char * const *paths;
+  int lxt_type;
+} lxt_groups[] = {
+  { mdt_paths, LXT_TYPE_MDT },
+  { ost_paths, LXT_TYPE_OST },
 };
 
 struct lxt {
@@ -223,7 +247,7 @@ struct lxt *lxt_lookup(const char *name, int type)
 
   hlist_add_head(&l->l_hash_node, head);
   list_add(&l->l_link, &lxt_list);
-  l->l_type = (type == LXT_TYPE_MDS) ? LXT_TYPE_MDT : type;
+  l->l_type = type;  /* caller always passes LXT_TYPE_MDT or LXT_TYPE_OST */
 
   if (l->l_type == LXT_TYPE_MDT)
     serv_status.ss_nr_mdt++;
@@ -332,46 +356,52 @@ static void collect_all(double now)
 {
   struct lxt *l, *l_tmp;
   LIST_HEAD(tmp_list);
-  size_t i;
+  size_t g, i;
 
   list_splice_init(&lxt_list, &tmp_list);
 
   ASSERT(list_empty(&lxt_list));
 
-  for (i = 0; i < sizeof(top_dir_path) / sizeof(top_dir_path[0]); i++) {
-    DIR *top_dir = NULL;
+  for (g = 0; g < sizeof(lxt_groups) / sizeof(lxt_groups[0]); g++) {
+    const char * const *paths = lxt_groups[g].paths;
+    int lxt_type = lxt_groups[g].lxt_type;
 
-    top_dir = opendir(top_dir_path[i]);
-    if (top_dir == NULL) {
-      ERROR("cannot open `%s': %m\n", top_dir_path[i]);
-      goto next;
-    }
-
-    struct dirent *de;
-    while ((de = readdir(top_dir)) != NULL) {
-      char exp_dir_path[256];
-
-      if (de->d_type != DT_DIR || de->d_name[0] == '.')
+    /* Try each candidate path in priority order; stop at the first one that
+     * is accessible.  This prevents double-counting when, e.g., both
+     * /sys/kernel/debug/lustre/mdt and /proc/fs/lustre/mdt are present.
+     */
+    for (i = 0; paths[i] != NULL; i++) {
+      DIR *top_dir = opendir(paths[i]);
+      if (top_dir == NULL) {
+        if (errno != ENOENT)
+          ERROR("cannot open `%s': %m\n", paths[i]);
         continue;
+      }
 
-      TRACE("de_name `%s'\n", de->d_name);
+      struct dirent *de;
+      while ((de = readdir(top_dir)) != NULL) {
+        char exp_dir_path[256];
 
-      snprintf(exp_dir_path, sizeof(exp_dir_path), "%s/%s/exports",
-               top_dir_path[i], de->d_name);
+        if (de->d_type != DT_DIR || de->d_name[0] == '.')
+          continue;
 
-      l = lxt_lookup(de->d_name, i);
-      if (l == NULL)
-        continue;
+        TRACE("de_name `%s'\n", de->d_name);
 
-      if (lxt_collect(l, exp_dir_path, now) == 0)
-        list_move(&l->l_link, &lxt_list);
-    }
+        snprintf(exp_dir_path, sizeof(exp_dir_path), "%s/%s/exports",
+                 paths[i], de->d_name);
 
-  next:
-    if (top_dir != NULL)
+        l = lxt_lookup(de->d_name, lxt_type);
+        if (l == NULL)
+          continue;
+
+        if (lxt_collect(l, exp_dir_path, now) == 0)
+          list_move(&l->l_link, &lxt_list);
+      }
+
       closedir(top_dir);
-
-    chdir("/");
+      chdir("/");
+      break;  /* first accessible path wins; skip remaining candidates */
+    }
   }
 
   /* Kill all lxt's we didn't just see. */
